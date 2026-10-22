@@ -20,9 +20,13 @@ import kotlinx.coroutines.coroutineScope
 class Inpainter(
     modelPath: String,
     private val cfg: InpainterConfig = InpainterConfig(),
+    private val miganModelPath: String? = null,
+    private val lamaOnnxPath: String? = null,
 ) : AutoCloseable {
 
     private var ncnnHandle: Long = 0L
+    private var miganHandle: Long = 0L
+    private var lamaOrt: LamaOrtInpainter? = null
     /** 實際生效的後端；無 adb 時由呼叫端寫進 log/圖確認。 */
     val ep: String = "NCNN-CPU"
 
@@ -53,12 +57,39 @@ class Inpainter(
             return@coroutineScope result
         }
 
-        // aot（預設）：全區都跑 AOT-GAN 整頁重建；標 onArt 讓 Renderer 給黑字粗白邊。
+        // 模型重建（aot 整頁 [OG] / lama 逐區磚）：結果合成進 result 的遮罩像素；標 onArt 讓 Renderer 給黑字粗白邊。
         regions.forEach { it.onArt = true }
         val maskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         maskBmp.setPixels(maskPx, 0, w, 0, 0, w, h)
-        runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+        val tiledDone = when (cfg.method) {
+            "migan" -> {
+                val net = miganNet()
+                net != 0L && runTiledRegions(page, maskBmp, regions, result, maskPx, w, h) { c, m -> runMiganTile(net, c, m) }
+            }
+            "lama" -> {
+                val ort = lamaOrtRunner()
+                ort != null && runTiledRegions(page, maskBmp, regions, result, maskPx, w, h) { c, m -> ort.runTile(c, m) }
+            }
+            else -> false
+        }
+        if (!tiledDone) {
+            runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+        }
         maskBmp.recycle()
+        // 平坦區路由：背景夠平（std 低＝純色泡泡）的區，AOT 重建反而可能留影/糊化 → 改平塗原圖取樣的背景色
+        // 蓋掉該區遮罩像素（像素級乾淨），並撤 onArt（平坦底走 Renderer auto 配色、不需粗白邊）。
+        if (cfg.flatFillFlatRegions) {
+            val origPx = IntArray(w * h); page.getPixels(origPx, 0, w, 0, 0, w, h)
+            val tightPx = IntArray(w * h); textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
+            for (r in regions) {
+                val s = bgStats(origPx, tightPx, r, w, h)
+                r.dbgStd = s.std; r.dbgWhite = s.meanLum
+                if (s.std < cfg.flatMaxStd) {
+                    flatFill(result, maskPx, r, s.color, cfg.bboxPad, w, h)
+                    r.onArt = false
+                }
+            }
+        }
         result
     }
 
@@ -68,6 +99,8 @@ class Inpainter(
      */
     fun warmUp() {
         if (cfg.method == "boxfill") return
+        if (cfg.method == "lama") { runCatching { lamaOrtRunner()?.warmUp() }; return }
+        if (cfg.method == "migan") { miganNet(); return }
         val w = 64
         val h = 64
         val page = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
@@ -280,11 +313,119 @@ class Inpainter(
         result.setPixels(cur, 0, o.ww, o.x0, o.y0, o.ww, o.wh)
     }
 
+    /** MI-GAN net（lazy）：method=migan 且模型在才載；載不到回 0 → 呼叫端退回 AOT [OG]。fp32（品質路徑、不冒 fp16 風險）。 */
+    private fun miganNet(): Long {
+        if (miganHandle != 0L) return miganHandle
+        val path = miganModelPath ?: return 0L
+        if (!path.endsWith(".param")) return 0L
+        val bin = path.removeSuffix(".param") + ".bin"
+        miganHandle = runCatching {
+            NcnnBackend.createNetEx(path, bin, numThreads = 0, fp16Storage = false, fp16Arith = false)
+        }.getOrDefault(0L)
+        if (miganHandle == 0L) Log.w(TAG, "MI-GAN 模型載入失敗：$path")
+        return miganHandle
+    }
+
+    /** LaMa ORT runner（lazy）：method=lama 且 ONNX 模型在才建；建不起來回 null → 退回 AOT [OG]。 */
+    private fun lamaOrtRunner(): LamaOrtInpainter? {
+        lamaOrt?.let { return it }
+        val path = lamaOnnxPath ?: return null
+        if (!path.endsWith(".onnx")) return null
+        val ort = LamaOrtInpainter(path)
+        lamaOrt = ort
+        return ort
+    }
+
+    /**
+     * 逐區磚去字（migan NCNN / lama ORT 共用骨架）：每區取 bbox 外擴 margin 的裁切 → [tile] 推論（內部縮到
+     * 固定方磚再放回裁切尺寸）→ 只合成該區遮罩像素（[compositePixels] 的窗口版）。逐區近原生解析度＝避開
+     * 「整頁縮小必糊」（上游當年退役整頁 LaMa 的原因）；代價是 CPU 時間（品質門別、使用者自選）。
+     * 全部磚失敗回 false（呼叫端整頁退 AOT）。
+     */
+    private fun runTiledRegions(
+        page: Bitmap, maskBmp: Bitmap, regions: List<TextRegion>, result: Bitmap,
+        maskPx: IntArray, w: Int, h: Int, tile: (Bitmap, Bitmap) -> Bitmap?,
+    ): Boolean {
+        var any = false
+        for (r in regions) {
+            val bw = (r.x1 - r.x0).toInt(); val bh = (r.y1 - r.y0).toInt()
+            val margin = maxOf(48, maxOf(bw, bh) / 2)
+            val cx0 = (r.x0.toInt() - margin).coerceIn(0, w - 1)
+            val cy0 = (r.y0.toInt() - margin).coerceIn(0, h - 1)
+            val cx1 = (r.x1.toInt() + margin).coerceIn(cx0 + 1, w)
+            val cy1 = (r.y1.toInt() + margin).coerceIn(cy0 + 1, h)
+            val cw = cx1 - cx0; val ch = cy1 - cy0
+            val crop = Bitmap.createBitmap(page, cx0, cy0, cw, ch)
+            val cropMask = Bitmap.createBitmap(maskBmp, cx0, cy0, cw, ch)
+            val out = tile(crop, cropMask)
+            crop.recycle(); cropMask.recycle()
+            if (out != null) {
+                val px = IntArray(cw * ch)
+                out.getPixels(px, 0, cw, 0, 0, cw, ch)
+                out.recycle()
+                compositePixels(result, maskPx, WinOut(cx0, cy0, cw, ch, px))
+                any = true
+            }
+        }
+        if (!any) Log.w(TAG, "逐區磚全失敗，退回 AOT")
+        return any
+    }
+
+    /**
+     * 單磚 MI-GAN 推論：裁切＋遮罩縮到 [MIGAN_TILE] 方磚 → 通用 extract → 放回裁切尺寸。失敗回 null。
+     * I/O 契約（轉檔定案）：in0＝4 通道 CHW（RGB∈[0,1] 原圖、mask∈{0,1}）、out0＝3 通道 CHW∈[0,1]。
+     */
+    private fun runMiganTile(net: Long, crop: Bitmap, cropMask: Bitmap): Bitmap? {
+        val t = MIGAN_TILE
+        val imgScaled = Bitmap.createScaledBitmap(crop, t, t, true)
+        val maskScaled = Bitmap.createScaledBitmap(cropMask, t, t, false)
+        return try {
+            val area = t * t
+            val ip = IntArray(area); imgScaled.getPixels(ip, 0, t, 0, 0, t, t)
+            val mp = IntArray(area); maskScaled.getPixels(mp, 0, t, 0, 0, t, t)
+            val chw = FloatArray(4 * area)
+            for (i in 0 until area) {
+                val p = ip[i]
+                chw[i] = ((p shr 16) and 0xFF) / 255f
+                chw[area + i] = ((p shr 8) and 0xFF) / 255f
+                chw[2 * area + i] = (p and 0xFF) / 255f
+                chw[3 * area + i] = if ((mp[i] and 0xFF) > 127) 1f else 0f
+            }
+            val out = FloatArray(3 * area)
+            val rc = NcnnBackend.extract(net, chw, t, t, 4, arrayOf("out0"), arrayOf(out))
+            check(rc == 0) { "NCNN MI-GAN 推論失敗 rc=$rc" }
+            val resScaled = miganArrToBitmap(out, t)
+            val back = Bitmap.createScaledBitmap(resScaled, crop.width, crop.height, true)
+            if (back !== resScaled) resScaled.recycle()
+            back
+        } catch (e: Throwable) {
+            Log.w(TAG, "MI-GAN 磚失敗：${e.message}"); null
+        } finally {
+            imgScaled.recycle(); maskScaled.recycle()
+        }
+    }
+
+    /** MI-GAN 輸出陣列 [3*n*n]∈[0,1] → Bitmap。 */
+    private fun miganArrToBitmap(arr: FloatArray, n: Int): Bitmap {
+        val area = n * n
+        val px = IntArray(area)
+        for (i in 0 until area) {
+            val r = (arr[i] * 255f).toInt().coerceIn(0, 255)
+            val g = (arr[area + i] * 255f).toInt().coerceIn(0, 255)
+            val b = (arr[2 * area + i] * 255f).toInt().coerceIn(0, 255)
+            px[i] = Color.rgb(r, g, b)
+        }
+        return Bitmap.createBitmap(px, n, n, Bitmap.Config.ARGB_8888)
+    }
+
     override fun close() {
         if (ncnnHandle != 0L) { NcnnBackend.releaseNet(ncnnHandle); ncnnHandle = 0L }
+        if (miganHandle != 0L) { NcnnBackend.releaseNet(miganHandle); miganHandle = 0L }
+        lamaOrt?.close(); lamaOrt = null
     }
 
     companion object {
         private const val TAG = "Inpainter"
+        private const val MIGAN_TILE = 512  // MI-GAN 方磚邊長（轉檔固定輸入；逐區裁切縮放進出）
     }
 }

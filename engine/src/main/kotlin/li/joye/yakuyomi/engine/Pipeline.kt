@@ -6,6 +6,7 @@ import android.util.Log
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlin.math.roundToInt
 
 /**
  * 單頁翻譯結果（§11：成功才覆蓋+marker、略過不覆蓋、失敗不覆蓋待重試）。
@@ -98,10 +99,22 @@ class Pipeline(
             Log.e(TAG, "OCR 失敗", t); return@coroutineScope PageResult.Failed("ocr: ${t.message}")
         }
         EngineTrace.log("pipe.ocr.exit")
+        // 實驗 secondPass：弱行（讀不到字／低分短讀）裁出 2× 放大再 OCR 一次（分群前、只採用更好的結果）。
+        if (cfg.ocr.secondPass) {
+            try {
+                secondPassOcr(page, lines)
+            } catch (t: Throwable) {
+                Log.w(TAG, "OCR 二輪整體失敗（略過）: ${t.message}")
+            }
+        }
         val regions = Grouping.group(lines)
         val ocrMs = System.currentTimeMillis() - tOcr
         // 去字集＝有 OCR 原文的區（空白＝疑似誤偵測，不去字、保畫面）。此集翻譯前就確定 ⇒ 去字可與翻譯並發。
         val textRegions = regions.filter { it.sourceText.isNotBlank() }
+        // 實驗 matchTextColor：去字前從原圖取樣每區的筆畫色（去字後原字像素就沒了，必須在此量）。
+        if (cfg.render.matchTextColor) {
+            for (r in textRegions) r.srcTextColor = sampleTextColor(page, detection.textMask, r)
+        }
         if (textRegions.isEmpty()) {
             return@coroutineScope PageResult.Skipped("OCR 全空", PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0))
         }
@@ -125,11 +138,11 @@ class Pipeline(
         // per-call 診斷 metadata（區域變數、不讀 LlmTranslator 的共享單值欄位 → 跨頁併發各頁拿自己的、不 race）。
         var llmError: String? = null
         var llmRaw: String? = null
+        val llm = translator as? LlmTranslator
         if (translator != null) {
             val tTr = System.currentTimeMillis()
             EngineTrace.log("pipe.translate.enter n=${textRegions.size}")
             val cht = try {
-                val llm = translator as? LlmTranslator
                 if (llm != null) {
                     // 走 translateDetailed → per-call 拿 translations + usage + error + raw（跨頁併發安全）。
                     val r = llm.translateDetailed(textRegions.map { it.sourceText })
@@ -177,8 +190,16 @@ class Pipeline(
             }
         }
         // 失敗的區（不在 kept）→ 譯文改回原文＝去字後重貼 OCR 日文（TextRegion 無 equals override→HashSet 走 identity）。
+        // 實驗 eraseUntranslated：失敗區改為「只去字、不回貼」（多為被 LLM 原樣回傳的狀聲詞 SFX）⇒ 排版清單濾掉它們。
         val keptSet = kept.toHashSet()
-        textRegions.forEach { if (it !in keptSet) it.translatedText = it.sourceText }
+        val renderRegions: List<TextRegion>
+        if (cfg.render.eraseUntranslated) {
+            textRegions.forEach { if (it !in keptSet) it.translatedText = "" }
+            renderRegions = textRegions.filter { it.translatedText.isNotBlank() }
+        } else {
+            textRegions.forEach { if (it !in keptSet) it.translatedText = it.sourceText }
+            renderRegions = textRegions
+        }
 
         // 等去字完成（多半已與翻譯重疊跑完）
         EngineTrace.log("pipe.inpaint.await")
@@ -188,11 +209,41 @@ class Pipeline(
             Log.e(TAG, "去字失敗", t); return@coroutineScope PageResult.Failed("inpaint: ${t.message}")
         }
 
-        // 排版（全 textRegions：kept 貼譯文、失敗區貼原文）
+        // 排版（renderRegions：kept 貼譯文、失敗區貼原文；eraseUntranslated 開時失敗區不入列＝只去字不回貼）
         val tRn = System.currentTimeMillis()
         EngineTrace.log("pipe.render.enter")
-        val finalPage = Renderer.render(cleaned, textRegions, cfg.render, typeface)
-        val renderMs = System.currentTimeMillis() - tRn
+        val report = Renderer.renderWithReport(cleaned, renderRegions, cfg.render, typeface)
+        var finalPage = report.bitmap
+        var renderMs = System.currentTimeMillis() - tRn
+        // 實驗 fitRetranslate：字級到底仍溢出的 kept 區 → 帶「改短」指示向 LLM 重翻一次（只收更短的新譯文）、重排一次。
+        if (cfg.translator.fitRetranslate && llm != null && report.overflow.isNotEmpty()) {
+            val targets = report.overflow.filter { it in keptSet }
+            if (targets.isNotEmpty()) {
+                EngineTrace.log("pipe.fit-retry n=${targets.size}")
+                val retry = try {
+                    llm.translateDetailed(targets.map { it.sourceText }, FIT_SHORTER_INSTRUCTION)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "fit 重翻失敗，保留原譯文：${t.message}")
+                    null
+                }
+                if (retry != null) {
+                    retry.usage?.let { promptTok += it.promptTokens; completionTok += it.completionTokens }
+                    var changed = false
+                    targets.forEachIndexed { j, r ->
+                        val nt = retry.translations.getOrNull(j)
+                        if (nt != null && nt.isNotBlank() && nt != r.sourceText && nt.length < r.translatedText.length) {
+                            r.translatedText = nt
+                            changed = true
+                        }
+                    }
+                    if (changed) {
+                        val tR2 = System.currentTimeMillis()
+                        finalPage = Renderer.render(cleaned, renderRegions, cfg.render, typeface)
+                        renderMs += System.currentTimeMillis() - tR2
+                    }
+                }
+            }
+        }
         EngineTrace.log("pipe.page.done")
 
         PageResult.Translated(
@@ -219,6 +270,79 @@ class Pipeline(
         EngineTrace.log("warmup.done")
     }
 
+    /**
+     * 實驗 secondPass OCR（[OcrConfig.secondPass]）：弱行＝首輪 text 空白，或偵測分數 < 0.75 且只讀到 ≤2 字。
+     * 把該行 bbox（外擴 6px）從原圖裁出、2× 放大，quad 同步平移＋縮放後走同一 [OcrEngine.recognize] 再讀一次；
+     * 只在二輪「非空且（首輪空 或 更長）」時採用（連 direction 一起）。逐行 best-effort，失敗不影響主流程。
+     */
+    private suspend fun secondPassOcr(page: Bitmap, lines: List<TextLine>) {
+        val weak = lines.filter { it.text.isBlank() || (it.score < 0.75f && it.text.length <= 2) }
+        if (weak.isEmpty()) return
+        EngineTrace.log("pipe.ocr.secondpass n=${weak.size}")
+        for (line in weak) {
+            try {
+                val pad = 6f
+                val xi = (line.quad.minOf { it.x } - pad).coerceAtLeast(0f).roundToInt()
+                val yi = (line.quad.minOf { it.y } - pad).coerceAtLeast(0f).roundToInt()
+                val w = ((line.quad.maxOf { it.x } + pad).roundToInt() - xi).coerceAtMost(page.width - xi)
+                val h = ((line.quad.maxOf { it.y } + pad).roundToInt() - yi).coerceAtMost(page.height - yi)
+                if (w < 8 || h < 8) continue
+                val crop = Bitmap.createBitmap(page, xi, yi, w, h)
+                val big = Bitmap.createScaledBitmap(crop, w * 2, h * 2, true)
+                try {
+                    val nl = TextLine(
+                        line.quad.map { Pt((it.x - xi) * 2f, (it.y - yi) * 2f) },
+                        line.score,
+                    )
+                    ocr.recognize(big, listOf(nl))
+                    if (nl.text.isNotBlank() && (line.text.isBlank() || nl.text.length > line.text.length)) {
+                        line.text = nl.text
+                        line.direction = nl.direction
+                    }
+                } finally {
+                    crop.recycle()
+                    big.recycle()
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "OCR 二輪單行失敗（略過）: ${t.message}")
+            }
+        }
+    }
+
+    /**
+     * 原文字色取樣：區 bbox ∩ seg 筆畫遮罩內的原圖像素，逐通道取中位數（中位數抗抗鋸齒邊緣的混色像素）。
+     * 筆畫像素 < 8 → null（Renderer 退回 auto 色）。直方圖法（256 bins/通道），不建大清單。
+     */
+    private fun sampleTextColor(page: Bitmap, textMask: Bitmap, region: TextRegion): Int? {
+        val w = page.width
+        val h = page.height
+        val x0 = region.x0.toInt().coerceIn(0, w - 1)
+        val y0 = region.y0.toInt().coerceIn(0, h - 1)
+        val x1 = region.x1.toInt().coerceIn(x0 + 1, w)
+        val y1 = region.y1.toInt().coerceIn(y0 + 1, h)
+        val bw = x1 - x0
+        val bh = y1 - y0
+        val px = IntArray(bw * bh)
+        page.getPixels(px, 0, bw, x0, y0, bw, bh)
+        val mp = IntArray(bw * bh)
+        textMask.getPixels(mp, 0, bw, x0, y0, bw, bh)
+        val hr = IntArray(256); val hg = IntArray(256); val hb = IntArray(256)
+        var n = 0
+        for (i in px.indices) {
+            if ((mp[i] and 0xFF) <= 127) continue
+            val p = px[i]
+            hr[(p shr 16) and 0xFF]++; hg[(p shr 8) and 0xFF]++; hb[p and 0xFF]++; n++
+        }
+        if (n < 8) return null
+        fun median(hist: IntArray): Int {
+            var acc = 0
+            val half = n / 2
+            for (v in 0..255) { acc += hist[v]; if (acc > half) return v }
+            return 255
+        }
+        return android.graphics.Color.rgb(median(hr), median(hg), median(hb))
+    }
+
     /** 釋放 detector/ocr/inpainter 的原生 ONNX session（見類別說明的生命週期注意事項）。 */
     override fun close() {
         runCatching { detector.close() }
@@ -228,5 +352,11 @@ class Pipeline(
 
     companion object {
         private const val TAG = "Pipeline"
+
+        /** fit 改短重翻的附加指示（只進該次呼叫的 system prompt，見 [LlmTranslator.translateDetailed]）。 */
+        private const val FIT_SHORTER_INSTRUCTION =
+            "IMPORTANT: The previous translations of the following lines were too long to fit inside their speech bubbles. " +
+                "Translate each line into a much shorter, more concise version — cut every word that is not essential — " +
+                "while keeping the core meaning."
     }
 }

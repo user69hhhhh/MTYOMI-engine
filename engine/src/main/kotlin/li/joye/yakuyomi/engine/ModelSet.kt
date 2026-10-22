@@ -34,6 +34,18 @@ data class ModelSet(
      * 檔名關鍵字 `paddle` 與其他角色不撞（不含 `ocr`/`dbnet`/`aot`/`manga_seg`/`cartoonseg`）。
      */
     val ocrPaddleArabic: String? = null,
+    /**
+     * MI-GAN 去字（`migan_inpaint.ncnn.param`，同名 `.bin` 需在旁）。**選配**：balanced 品質去字門別，
+     * 缺了 [Inpainter] 自動退回 AOT-GAN [OG]。檔名關鍵字 `migan` 與其他角色不撞
+     * （不含 `ocr`/`dbnet`/`aot`/`manga_seg`/`cartoonseg`/`paddle`/`lama`）。
+     */
+    val miganInpainterNcnn: String? = null,
+    /**
+     * LaMa 去字 ONNX（`lama_fp32.onnx`；走 **ONNX Runtime**、非 NCNN——LaMa 的 FFT 核心 NCNN 跑不了，
+     * 2026-10 MTYOMI 實測）。**選配**：max quality 去字門別，缺了退回 AOT-GAN [OG]。
+     * 此欄不由 [resolve] 填（它只掃 `.param`），由 app 端解析 `.onnx` 後直接給。
+     */
+    val lamaInpaintOnnx: String? = null,
 ) {
     companion object {
         /**
@@ -61,6 +73,7 @@ data class ModelSet(
                 charSegYoloNcnn = find("manga_seg"),
                 charSegCsegNcnn = find("cartoonseg"),
                 ocrPaddleArabic = find("paddle"),
+                miganInpainterNcnn = find("migan"),
             )
         }
     }

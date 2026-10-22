@@ -45,6 +45,9 @@ class TextRegion(
     var dbgStd: Float = -1f
     var dbgWhite: Float = -1f
 
+    /** 原文字色（筆畫像素 RGB 中位數、ARGB）：由 :engine 的 `Pipeline` 在去字前從原圖取樣；實驗 matchTextColor 開時 `Renderer` 據此填色。null＝未取樣/取樣不足。 */
+    var srcTextColor: Int? = null
+
     /** 合併原文（lines 已依閱讀序排好）。日文無空白，直接相接。 */
     val sourceText: String get() = lines.joinToString("") { it.text }
 

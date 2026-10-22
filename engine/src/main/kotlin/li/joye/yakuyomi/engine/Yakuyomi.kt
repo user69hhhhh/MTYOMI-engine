@@ -55,9 +55,14 @@ object Yakuyomi {
         } else {
             Ocr(models.ocr, alphabet, config.ocr)
         }
-        // 去字兩門別（boxfill/aot）皆用同一顆 NCNN AOT 模型（boxfill 只平塗不跑它、但仍要載得起來）。
+        // 去字門別（boxfill/aot/lama）共用此入口：AOT 模型必備（lama 缺席/失敗時的退回路徑）；LaMa 選配（缺＝退 aot）。
         EngineTrace.log("create.inpainter")
-        val inpainter = Inpainter(models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"), config.inpainter)
+        val inpainter = Inpainter(
+            models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"),
+            config.inpainter,
+            models.miganInpainterNcnn,
+            models.lamaInpaintOnnx,
+        )
         val translator = apiKey?.takeIf { it.isNotBlank() }?.let { LlmTranslator(it, config.translator) }
         EngineTrace.log("create.done")
         return Pipeline(detector, ocr, translator, inpainter, config, typeface)

@@ -46,6 +46,9 @@ dependencies {
     api(project(":inference-core"))
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
+    // LaMa 去字（max quality 門別）走 ONNX Runtime——NCNN 無 FFT 層、LaMa 轉 NCNN 不可行（MTYOMI fork 決策，
+    // 見 LamaOrtInpainter）。只服務 method="lama"；其餘門別（aot/migan/boxfill）不載入它。
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.31.0")
 
     testImplementation("junit:junit:4.13.2")
 }

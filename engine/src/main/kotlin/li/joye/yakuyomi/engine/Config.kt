@@ -62,6 +62,9 @@ data class OcrConfig(
     // 只影響 [Yakuyomi.create] 建哪顆 OCR；paddle 模型（[ModelSet.ocrPaddleArabic]）或阿拉伯字典缺席時自動退回 default。
     // 由 app 端決定何時給 "paddle"（來源語言＝阿拉伯文＋使用者在翻譯設定頁選 PaddleOCR）。
     val engine: String = "default",
+    // 〔設定〕實驗（fork）：弱行二次 OCR——首輪讀不到字、或偵測分數低且只讀到 1–2 字的行，把該行裁出 2× 放大再讀一次
+    // （小字與阿拉伯文點畫在放大裁切下較易辨識；主路徑與 PaddleOCR 走同一 [OcrEngine] 介面）。代價＝弱行逐行多跑一次推論。
+    val secondPass: Boolean = false,
 )
 
 // 預設 few-shot（日→繁中）：示範 <|i|> 逐行格式。改語言對時連同 toLangName/fromLangName 一起換成對應譯文。
@@ -109,6 +112,12 @@ data class TranslatorConfig(
     val batchSize: Int = 8,              // m-i-t --batch-size：concurrent 模式＝同時並發頁數上限；merged 模式＝每 prompt 併幾頁
     val batchConcurrent: Boolean = true, // m-i-t --batch-concurrent：true＝逐頁分開請求、批內並發（防 truncation/幻覺）；false＝併大 prompt
     val filterText: String? = null,   // 〔設定〕config.filter_text：regex 命中譯文則濾掉該區（例 ".*badtext.*"）
+    // 〔設定〕實驗（fork）：使用者詞彙表（多行「原文 = 譯文」純文字）。非空 → [LlmTranslator] 把它附進 system prompt，
+    // 要求命中術語一律用表列譯法——人名/地名/招式名跨章不再跳寫法。空＝不附（現行行為）。
+    val glossary: String = "",
+    // 〔設定〕實驗（fork）：譯文塞不下時的改短重翻——排版回報「字級到底仍溢出」的區，Pipeline 帶「盡量短」指示
+    // 向 LLM 重翻一次（只收比原譯文更短者）、重排一次。每頁至多多一次 LLM 請求、且只在有溢出區時。
+    val fitRetranslate: Boolean = false,
 )
 
 data class InpainterConfig(
@@ -116,10 +125,14 @@ data class InpainterConfig(
     //   boxfill＝「快速去字」：取字區就近的背景色平塗（瞬間、平/單色泡泡最乾淨；壓畫面/多彩會塗錯色塊＝粗糙）。不跑去字模型。
     //   aot（預設）＝「AI 去字」：全區都跑 AOT-GAN 重建背景，整頁一次縮到 [tileSize]。走 NCNN AOT；去字被翻譯的網路等待蓋住(§8)，故 tile 大小幾乎不加牆鐘。
     val method: String = "aot",
+    // 平坦區路由（aot/lama 共用）：背景亮度 std < [flatMaxStd] 的區（純色泡泡）改平塗取樣背景色——像素級完美、
+    // 免模型在平坦區糊化/留影；std 高的壓畫面區才跑模型重建。量測走 Inpainter.bgStats（去字前原圖、緊遮罩排除筆畫）。
+    val flatFillFlatRegions: Boolean = true,
+    val flatMaxStd: Float = 12f,
     val tileSize: Int = 768,          // 整頁 AOT 去字解析度。AOT 全卷積·任意尺寸；768＝畫質/記憶體/藏在翻譯下的甜蜜點（真機 A/B 定案：512 忙碌區糊、1024 記憶體 2× 且貼翻譯天花板）。
     // 去字遮罩膨脹（半徑 = maskDilate/2）。★關鍵：漫畫在臉/頭髮上的字會描一圈白邊；遮罩太薄只蓋黑筆畫、
     // 白邊留在外面 → 去字後殘白塊。加厚到半徑~12 吞掉白邊後，AOT 周圍 context 全變底圖 → 重建乾淨（桌面 inpaint_dev DIL=12 實證 ≈ MIT）。
-    val maskDilate: Float = 24f,      // 半徑 12px：吞掉文字白邊（之前 7=半徑4 會殘白塊）
+    val maskDilate: Float = 30f,      // 半徑 15px：吞掉文字白邊＋抗鋸齒光暈（之前 24＝半徑12；2026-10 MTYOMI 加大消殘影）
     val bboxPad: Int = 16,            // 去字 allow 用區域 bbox 矩形外擴 px：涵蓋貼 bbox 邊界的假名（行框太緊會漏）
 )
 
@@ -137,6 +150,18 @@ data class RenderConfig(
     val fontScale: Float = 0.85f, // 算好字級後整體縮放（<1＝更小、更 fit 格子、留邊距）
     // 文字顏色：auto＝取去字後背景亮度判黑/白字（最穩、白底黑字/黑底白字）；mono＝一律黑字白邊
     val colorMode: String = "auto",
+    // 〔設定〕實驗：比對原文字級——以偵測行框量到的原文 glyph 尺寸（橫排取行高、直排取欄寬，中位數）當排版字級
+    // 上限：只縮不放大（譯文太長塞不下才縮）、且不再乘 [fontScale]（乘了就不是原尺寸）。關＝現行純 fit 行為。
+    val matchTextSize: Boolean = false,
+    // 〔設定〕實驗：比對原文顏色——Pipeline 於去字前從原圖取樣筆畫色寫入 TextRegion.srcTextColor，排版填色用它
+    // （描邊改依該色亮度取反襯）；取樣不到（null）退回 auto/mono。關＝現行行為。
+    val matchTextColor: Boolean = false,
+    // 〔設定〕實驗（fork）：去字不回貼——譯文被過濾的區（多為 LLM 原樣回傳的狀聲詞 SFX）只去字、不重貼原文。
+    // 關＝現行 §11 行為（失敗區去字後重貼 OCR 原文）。開的代價：真對白若被誤判過濾也會被抹掉，故列實驗。
+    val eraseUntranslated: Boolean = false,
+    // 〔設定〕實驗（fork）：防撕詞——橫排換行只在空白處斷行、絕不把一個詞從中間切成兩行（阿拉伯文 بالتأكيد 被切成
+    // بالتأك／يد 的撕裂）；塞不下就繼續縮字級，單詞比框還寬時整詞一行溢出也不切。無空白的文字（日/中）自動退回逐字換行。
+    val noWordTear: Boolean = false,
     val bgDark: Int = 110,       // auto：去字後背景平均亮度 < 此值＝暗底 → 白字
     // 縱中橫（tate-chu-yoko）：直排時把連續短 ASCII 串（2–4 字的數字/字母/!?）併成一格水平並排（年齡「20」、年份「2020」、「!?」不再上下堆疊歪頭讀）。
     // §4 第三層知情偏離：m-i-t/parity 逐字畫、無此邏輯；只影響直排內 ASCII 短串，CJK 不變。預設開、可關回逐字。

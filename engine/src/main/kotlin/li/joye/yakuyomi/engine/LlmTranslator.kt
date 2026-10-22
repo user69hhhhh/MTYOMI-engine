@@ -62,10 +62,10 @@ class LlmTranslator(
      * 翻譯一頁的所有 query → **per-call** [TranslateResult]（translations + usage + error + raw）。
      * 全程走區域變數、**不寫任何實例欄位** → 多頁併發呼叫互不干擾（跨頁流水線安全）。[Pipeline] 走這條。
      */
-    suspend fun translateDetailed(queries: List<String>): TranslateResult {
+    suspend fun translateDetailed(queries: List<String>, extraInstruction: String? = null): TranslateResult {
         if (queries.isEmpty()) return TranslateResult(emptyList())
         return try {
-            val (raw, usage) = request(buildMessages(queries))
+            val (raw, usage) = request(buildMessages(queries, extraInstruction))
             val parsed = parse(raw)
             val error = if (parsed.size < queries.size) "解析${parsed.size}/${queries.size}" else null
             val translations = queries.mapIndexed { i, q ->
@@ -90,10 +90,10 @@ class LlmTranslator(
         return r.translations
     }
 
-    private fun buildMessages(queries: List<String>): JSONArray {
+    private fun buildMessages(queries: List<String>, extraInstruction: String? = null): JSONArray {
         val userPrompt = queries.mapIndexed { i, q -> "<|${i + 1}|>$q" }.joinToString("\n")
         return JSONArray().apply {
-            put(msg("system", systemPrompt()))
+            put(msg("system", systemPrompt(extraInstruction)))
             // few-shot 同時示範 <|i|> 格式與語言對；任一空白＝不放（全靠 system + 格式規則）
             if (cfg.sampleSource.isNotBlank() && cfg.sampleTarget.isNotBlank()) {
                 put(msg("user", cfg.sampleSource))
@@ -104,9 +104,17 @@ class LlmTranslator(
     }
 
     /** 套入語言對：{to_lang}←toLangName、{from_lang}←fromLangName（空白＝省略來源語、讓 LLM 自己判）。 */
-    private fun systemPrompt(): String {
+    private fun systemPrompt(extraInstruction: String? = null): String {
         val fromClause = cfg.fromLangName.trim().let { if (it.isEmpty()) "" else "$it " }
-        return SYSTEM_TEMPLATE.replace("{to_lang}", cfg.toLangName).replace("{from_lang}", fromClause)
+        var prompt = SYSTEM_TEMPLATE.replace("{to_lang}", cfg.toLangName).replace("{from_lang}", fromClause)
+        // 實驗（fork）：使用者詞彙表——非空就附在 system 後，要求命中術語時一律用表列譯法（人名/地名跨章一致）。
+        if (cfg.glossary.isNotBlank()) {
+            prompt += "\n\nGlossary — whenever the source text contains one of these terms, use exactly the given translation for it:\n" +
+                cfg.glossary.trim()
+        }
+        // 單次呼叫附加指示（如 fit 改短重翻）：只進這一次請求、不污染其他頁。
+        if (!extraInstruction.isNullOrBlank()) prompt += "\n\n" + extraInstruction.trim()
+        return prompt
     }
 
     private fun msg(role: String, content: String) =

@@ -24,12 +24,22 @@ enum class TextOrientation { VERTICAL, HORIZONTAL, AUTO }
  */
 object Renderer {
 
+    /** 排版結果：成品圖＋「字級已降到底仍塞不下」的溢出區（供 Pipeline 的 fit 改短重翻實驗用）。 */
+    data class RenderResult(val bitmap: Bitmap, val overflow: List<TextRegion>)
+
     fun render(
         page: Bitmap,
         regions: List<TextRegion>,
         cfg: RenderConfig = RenderConfig(),
         tf: Typeface? = null,
-    ): Bitmap {
+    ): Bitmap = renderWithReport(page, regions, cfg, tf).bitmap
+
+    fun renderWithReport(
+        page: Bitmap,
+        regions: List<TextRegion>,
+        cfg: RenderConfig = RenderConfig(),
+        tf: Typeface? = null,
+    ): RenderResult {
         val out = page.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(out)
         val face = tf ?: Typeface.DEFAULT
@@ -38,6 +48,7 @@ object Renderer {
             color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 4f
             isAntiAlias = true; typeface = face
         }
+        val overflow = ArrayList<TextRegion>()
         for (region in regions) {
             val text = region.translatedText.ifBlank { region.sourceText }
             if (text.isBlank()) continue
@@ -62,20 +73,43 @@ object Renderer {
             } else {
                 x0 = region.x0; y0 = region.y0; x1 = region.x1; y1 = region.y1
             }
-            if (vertical) drawVertical(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, region.onArt)
-            else drawHorizontal(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, region.onArt)
+            val sizeCap = if (cfg.matchTextSize) sourceGlyphPx(region) else 0f
+            val fitted = if (vertical) {
+                drawVertical(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, region.onArt, sizeCap)
+            } else {
+                drawHorizontal(canvas, x0, y0, x1, y1, text, fill, stroke, cfg, region.onArt, sizeCap)
+            }
+            if (!fitted) overflow.add(region)
             if (rotate) canvas.restore()
         }
-        return out
+        return RenderResult(out, overflow)
     }
 
     /** 文字色 (fill, outline)：auto＝取去字後背景亮度（暗底白字、亮底黑字，對齊 parity auto_colors）；mono＝黑字白邊。 */
     private fun textColors(page: Bitmap, r: TextRegion, cfg: RenderConfig): Pair<Int, Int> {
+        // 實驗 matchTextColor：填色＝原文字色（Pipeline 去字前取樣）；描邊依其亮度反襯（暗字白邊、亮字黑邊）。
+        if (cfg.matchTextColor) {
+            r.srcTextColor?.let { c ->
+                val lum = 0.299 * Color.red(c) + 0.587 * Color.green(c) + 0.114 * Color.blue(c)
+                return c to if (lum < 128) Color.WHITE else Color.BLACK
+            }
+        }
         if (cfg.colorMode == "mono") return Color.BLACK to Color.WHITE
         // 壓在畫面上(lama 重建的 busy 背景)：一律黑字+粗白邊。白邊把字框出來，任何雜亂背景都讀得到（對齊 m-i-t 做法）。
         if (r.onArt) return Color.BLACK to Color.WHITE
         val lum = bgLuminance(page, r.x0, r.y0, r.x1, r.y1)
         return if (lum < cfg.bgDark) Color.WHITE to Color.BLACK else Color.BLACK to Color.WHITE
+    }
+
+    /** 原文 glyph 尺寸（px）：逐行 quad 包圍盒——橫排取高、直排取寬——的中位數。matchTextSize 的字級上限；0＝量不到。 */
+    private fun sourceGlyphPx(r: TextRegion): Float {
+        if (r.lines.isEmpty()) return 0f
+        val vertical = r.direction == "v"
+        val sizes = r.lines.map { ln ->
+            if (vertical) ln.quad.maxOf { it.x } - ln.quad.minOf { it.x }
+            else ln.quad.maxOf { it.y } - ln.quad.minOf { it.y }
+        }.filter { it > 0f }.sorted()
+        return if (sizes.isEmpty()) 0f else sizes[sizes.size / 2]
     }
 
     /** 去字後背景在文字框內的平均亮度（Rec.601）。 */
@@ -103,21 +137,23 @@ object Renderer {
     }
 
     /** 直排：欄右→左、格上→下、向上對齊；大小填滿放大後的文字框、每欄少 colTrim 格。每格＝1 字或 1 個縱中橫短串。 */
-    private fun drawVertical(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean = false) {
+    /** @return 是否在字級下限以上塞得下（false＝已降到 fontSizeMin 仍溢出，照畫但回報給 fit 重翻）。 */
+    private fun drawVertical(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean = false, sizeCap: Float = 0f): Boolean {
         val chars = text.filter { it != '\n' }
-        if (chars.isEmpty()) return
+        if (chars.isEmpty()) return true
         val cells = toVerticalCells(chars, cfg.tateChuYoko)  // 切格：一般字一格、短 ASCII 串併成一個縱中橫格
         val bw = (x1 - x0) * cfg.expandW         // 寬：放大後的文字框寬
         val colRoom = (y1 - y0) * cfg.expandH    // 直欄可用高（從文字框頂往下）
         var size = cfg.fontSizeMin
-        var s = min(colRoom.toInt(), cfg.fontSizeMax)
+        var fitted = false
+        var s = minOf(colRoom.toInt(), cfg.fontSizeMax, if (sizeCap > 0f) sizeCap.roundToInt() else Int.MAX_VALUE)
         while (s >= cfg.fontSizeMin) {
             val lh = s * 1.05f; val cw = s * 1.1f
             val cpc = maxOf(1, (colRoom / lh).toInt() - cfg.colTrim)
-            if (ceil(cells.size / cpc.toFloat()).toInt() * cw <= bw) { size = s; break }
+            if (ceil(cells.size / cpc.toFloat()).toInt() * cw <= bw) { size = s; fitted = true; break }
             s--
         }
-        size = maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())  // 整體縮小、更 fit
+        size = if (sizeCap > 0f) size else maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())  // matchTextSize 時已是原尺寸、不再縮；否則整體縮小、更 fit
         fill.textSize = size.toFloat(); stroke.textSize = size.toFloat()
         stroke.strokeWidth = maxOf(2f, size * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO))  // 描邊隨字級；壓畫面區用更粗白邊
         val lh = size * 1.05f; val cw = size * 1.1f
@@ -140,6 +176,7 @@ object Renderer {
                 cy += lh
             }
         }
+        return fitted
     }
 
     /**
@@ -202,23 +239,25 @@ object Renderer {
     }
 
     /** 橫排：列上→下、字左→右、向上對齊；大小填滿放大後的文字框。 */
-    private fun drawHorizontal(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean = false) {
+    /** @return 是否在字級下限以上塞得下（false＝已降到 fontSizeMin 仍溢出，照畫但回報給 fit 重翻）。 */
+    private fun drawHorizontal(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean = false, sizeCap: Float = 0f): Boolean {
         val bw = (x1 - x0) * cfg.expandW
         val rowRoom = (y1 - y0) * cfg.expandH
         var size = cfg.fontSizeMin
         var lines = listOf(text)
-        var s = min(rowRoom.toInt(), cfg.fontSizeMax)
+        var fitted = false
+        var s = minOf(rowRoom.toInt(), cfg.fontSizeMax, if (sizeCap > 0f) sizeCap.roundToInt() else Int.MAX_VALUE)
         while (s >= cfg.fontSizeMin) {
             fill.textSize = s.toFloat()
-            val ls = wrapCjk(text, fill, (bw - cfg.rowTrim * s).coerceAtLeast(s.toFloat())) // 每行少 rowTrim 字（橫向字數）
+            val ls = wrapText(text, fill, (bw - cfg.rowTrim * s).coerceAtLeast(s.toFloat()), cfg) // 每行少 rowTrim 字（橫向字數）
             val maxW = ls.maxOfOrNull { fill.measureText(it) } ?: 0f
-            if (ls.size * s * 1.18f <= rowRoom && maxW <= bw) { size = s; lines = ls; break }
+            if (ls.size * s * 1.18f <= rowRoom && maxW <= bw) { size = s; lines = ls; fitted = true; break }
             s--
         }
-        size = maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())  // 整體縮小、更 fit
+        size = if (sizeCap > 0f) size else maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())  // matchTextSize 時已是原尺寸、不再縮；否則整體縮小、更 fit
         fill.textSize = size.toFloat(); stroke.textSize = size.toFloat()
         stroke.strokeWidth = maxOf(2f, size * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO))  // 描邊隨字級；壓畫面區用更粗白邊
-        lines = wrapCjk(text, fill, (bw - cfg.rowTrim * size).coerceAtLeast(size.toFloat()))  // 縮小後重排（含 rowTrim）
+        lines = wrapText(text, fill, (bw - cfg.rowTrim * size).coerceAtLeast(size.toFloat()), cfg)  // 縮小後重排（含 rowTrim）
         val lh = size * 1.18f
         val tcx = (x0 + x1) / 2f
         var baseline = (y0 + y1) / 2f - lines.size * lh / 2f + size * ASCENT  // 垂直置中於框
@@ -228,6 +267,7 @@ object Renderer {
             canvas.drawText(ln, tx, baseline, fill)
             baseline += lh
         }
+        return fitted
     }
 
     private fun drawCharVertical(canvas: Canvas, ch: Char, cx: Float, cyc: Float, fill: Paint, stroke: Paint, border: Boolean) {
@@ -240,6 +280,37 @@ object Renderer {
         if (border) canvas.drawText(s, cx - w / 2f, baseline, stroke)
         canvas.drawText(s, cx - w / 2f, baseline, fill)
         if (rotate) canvas.restore()
+    }
+
+    /** 換行分派：防撕詞開＋文字含空白 → 逐詞換行（[wrapWords]）；否則逐字換行（[wrapCjk]，日/中無空白不受影響）。 */
+    private fun wrapText(text: String, paint: Paint, maxW: Float, cfg: RenderConfig): List<String> =
+        if (cfg.noWordTear && text.contains(' ')) wrapWords(text, paint, maxW) else wrapCjk(text, paint, maxW)
+
+    /**
+     * 逐詞換行（防撕詞）：只在空白處斷行，單詞永遠不被切成兩行。單詞本身比行寬還寬 → 自成一行（由 fit 迴圈繼續縮
+     * 字級；到底仍放不下就整詞溢出，見 [RenderConfig.noWordTear]）。段落（\n）各自處理，語義同 [wrapCjk]。
+     */
+    private fun wrapWords(text: String, paint: Paint, maxW: Float): List<String> {
+        val lines = ArrayList<String>()
+        for (para in text.split('\n')) {
+            val words = para.split(' ').filter { it.isNotEmpty() }
+            if (words.isEmpty()) {
+                lines.add("")
+                continue
+            }
+            var cur = words[0]
+            for (w in words.drop(1)) {
+                val cand = "$cur $w"
+                if (paint.measureText(cand) <= maxW) {
+                    cur = cand
+                } else {
+                    lines.add(cur)
+                    cur = w
+                }
+            }
+            lines.add(cur)
+        }
+        return lines
     }
 
     private fun wrapCjk(text: String, paint: Paint, maxW: Float): List<String> {
