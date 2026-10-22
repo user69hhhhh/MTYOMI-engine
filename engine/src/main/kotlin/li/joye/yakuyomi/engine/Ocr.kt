@@ -44,10 +44,13 @@ class Ocr(
     modelPath: String,
     private val dictionary: List<String>,
     private val cfg: OcrConfig = OcrConfig(),
-) : AutoCloseable {
+) : OcrEngine {
+
+    /** [OcrEngine] 入口：bicubic 用 config 預設（[OcrConfig.useBicubic]）；A/B 工具才直接呼叫帶 bicubic 的多載。 */
+    override suspend fun recognize(page: Bitmap, lines: List<TextLine>) = recognize(page, lines, cfg.useBicubic)
 
     /** 實際生效的精度組合："NCNN"（原 param：全 fp16／fp32 依 cfg）或 "NCNN-mixed"（無 adb 時由呼叫端寫進 log 確認）。 */
-    val backend: String
+    override val backend: String
     private var ncnnHandle: Long = 0L
     // 並發模式：每行單緒（Net num_threads=1）、靠 N 行並發填核；序列模式：單行用滿 NUM_THREADS。
     private val threads = if (cfg.concurrent) 1 else NUM_THREADS
@@ -120,7 +123,7 @@ class Ocr(
      * 暖機：對空白 strip 跑一次 OCR，讓 NCNN 首次 forward 的一次性配置（blob／workspace allocator、共用 PE 表 lazy 建表）
      * 先在單緒做完。併發翻多頁前先呼叫一次；strip 內容不重要（只為觸發一次 forward）。
      */
-    fun warmUp() {
+    override fun warmUp() {
         val strip = Bitmap.createBitmap(160, cfg.textHeight, Bitmap.Config.ARGB_8888)
         try {
             infer(stripToChw(strip))

@@ -28,6 +28,12 @@ data class ModelSet(
     val charSegYoloNcnn: String? = null,
     /** 夜讀人物分割 CartoonSegmentation（RTMDet-Ins）的 NCNN 版（`cartoonseg.ncnn.param`，同名 `.bin` 需在旁）。**選配**，同上。 */
     val charSegCsegNcnn: String? = null,
+    /**
+     * 阿拉伯文 OCR（PaddleOCR PP-OCRv3 arabic → NCNN，`paddle_ar_rec.ncnn.param`，同名 `.bin` 需在旁）。**選配**：
+     * fork 內建於 assets、由 app 端複製進 models 目錄後在此被認出；缺了只是 [PaddleOcr] 不可用（主 OCR 照常）。
+     * 檔名關鍵字 `paddle` 與其他角色不撞（不含 `ocr`/`dbnet`/`aot`/`manga_seg`/`cartoonseg`）。
+     */
+    val ocrPaddleArabic: String? = null,
 ) {
     companion object {
         /**
@@ -54,6 +60,7 @@ data class ModelSet(
                 aotInpainterNcnn = aotNcnn,
                 charSegYoloNcnn = find("manga_seg"),
                 charSegCsegNcnn = find("cartoonseg"),
+                ocrPaddleArabic = find("paddle"),
             )
         }
     }

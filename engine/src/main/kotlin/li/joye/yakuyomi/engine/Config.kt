@@ -58,6 +58,10 @@ data class OcrConfig(
     // 只在 ncnnFp16Storage 開且 CPU 有 asimdhp 時生效（否則 mixed param 裡的 Cast 會把 fp32 讀成垃圾），Ocr 會自動退回原 param。
     // 真機 9 頁 242 行：mixed 241（唯一不同那行是真值錯）、全 fp16 219 → 預設開；A/B 想固定跑「全 fp16」時關掉。
     val ncnnMixed: Boolean = true,
+    // 〔設定〕OCR 後端選擇："default"＝48px CTC（[Ocr]，日文主路徑）；"paddle"＝[PaddleOcr]（PaddleOCR 阿拉伯文）。
+    // 只影響 [Yakuyomi.create] 建哪顆 OCR；paddle 模型（[ModelSet.ocrPaddleArabic]）或阿拉伯字典缺席時自動退回 default。
+    // 由 app 端決定何時給 "paddle"（來源語言＝阿拉伯文＋使用者在翻譯設定頁選 PaddleOCR）。
+    val engine: String = "default",
 )
 
 // 預設 few-shot（日→繁中）：示範 <|i|> 逐行格式。改語言對時連同 toLangName/fromLangName 一起換成對應譯文。

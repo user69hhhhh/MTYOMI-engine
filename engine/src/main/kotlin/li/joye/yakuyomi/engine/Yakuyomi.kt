@@ -32,6 +32,7 @@ object Yakuyomi {
      * @param apiKey   翻譯 LLM 的 API key；**null/空白＝不翻譯**（只跑偵測/OCR/去字，純除錯）。
      * @param config   引擎設定（全可調，預設見各 `*Config`）。
      * @param typeface 算繪字型；null＝系統預設 CJK。
+     * @param paddleAlphabet 阿拉伯字典（161 行；[OcrConfig.engine]＝"paddle" 時 [PaddleOcr] 解碼用；空＝不用 paddle）。
      * @return 可 `use { }` 的 [TranslationEngine]；其 [TranslationEngine.close] 會釋放三顆模型的 native session。
      */
     fun create(
@@ -40,13 +41,20 @@ object Yakuyomi {
         apiKey: String?,
         config: EngineConfig = EngineConfig(),
         typeface: Typeface? = null,
+        paddleAlphabet: List<String> = emptyList(),
     ): TranslationEngine {
         // 三顆模型（偵測／OCR／去字）全 NCNN（產品 arm64、NCNN 必在；ORT 已整個從引擎拔除、LaMa 退役）。
         check(NcnnBackend.available) { "NCNN 原生庫未載入（arm64 應可用）" }
         EngineTrace.log("create.detector")
         val detector = Detector(models.detectorNcnn ?: error("需 NCNN 偵測模型（.param）"), config.detector)
         EngineTrace.log("create.ocr")
-        val ocr = Ocr(models.ocr, alphabet, config.ocr)
+        // OCR 後端：config 指定 paddle＋模型與阿拉伯字典都備齊 → PaddleOcr（阿拉伯文）；否則主路徑 Ocr。
+        val ocr: OcrEngine = if (config.ocr.engine == "paddle" && models.ocrPaddleArabic != null && paddleAlphabet.isNotEmpty()) {
+            EngineTrace.log("create.ocr.paddle")
+            PaddleOcr(models.ocrPaddleArabic, paddleAlphabet, config.ocr)
+        } else {
+            Ocr(models.ocr, alphabet, config.ocr)
+        }
         // 去字兩門別（boxfill/aot）皆用同一顆 NCNN AOT 模型（boxfill 只平塗不跑它、但仍要載得起來）。
         EngineTrace.log("create.inpainter")
         val inpainter = Inpainter(models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"), config.inpainter)

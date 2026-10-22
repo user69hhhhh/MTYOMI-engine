@@ -65,7 +65,7 @@ data class PageStats(
  */
 class Pipeline(
     private val detector: Detector,
-    private val ocr: Ocr,
+    private val ocr: OcrEngine,
     private val translator: Translator?, // null＝不翻譯（純偵測/OCR 除錯用）
     private val inpainter: Inpainter,
     private val cfg: EngineConfig = EngineConfig(),
