@@ -42,18 +42,29 @@ object Yakuyomi {
         config: EngineConfig = EngineConfig(),
         typeface: Typeface? = null,
         paddleAlphabet: List<String> = emptyList(),
+        paddleV6Alphabet: List<String> = emptyList(),
     ): TranslationEngine {
         // 三顆模型（偵測／OCR／去字）全 NCNN（產品 arm64、NCNN 必在；ORT 已整個從引擎拔除、LaMa 退役）。
         check(NcnnBackend.available) { "NCNN 原生庫未載入（arm64 應可用）" }
         EngineTrace.log("create.detector")
         val detector = Detector(models.detectorNcnn ?: error("需 NCNN 偵測模型（.param）"), config.detector)
         EngineTrace.log("create.ocr")
-        // OCR 後端：config 指定 paddle＋模型與阿拉伯字典都備齊 → PaddleOcr（阿拉伯文）；否則主路徑 Ocr。
-        val ocr: OcrEngine = if (config.ocr.engine == "paddle" && models.ocrPaddleArabic != null && paddleAlphabet.isNotEmpty()) {
-            EngineTrace.log("create.ocr.paddle")
-            PaddleOcr(models.ocrPaddleArabic, paddleAlphabet, config.ocr)
-        } else {
-            Ocr(models.ocr, alphabet, config.ocr)
+        // OCR 後端：config 指定 paddle＋模型與阿拉伯字典都備齊 → PaddleOcr（阿拉伯文）；
+        // paddle_v6_small／medium＋模型與 v6 字典備齊 → PaddleOcrV6（日／中）；否則主路徑 Ocr。
+        val ocr: OcrEngine = when {
+            config.ocr.engine == "paddle" && models.ocrPaddleArabic != null && paddleAlphabet.isNotEmpty() -> {
+                EngineTrace.log("create.ocr.paddle")
+                PaddleOcr(models.ocrPaddleArabic, paddleAlphabet, config.ocr)
+            }
+            config.ocr.engine == "paddle_v6_small" && models.ocrPaddleV6Small != null && paddleV6Alphabet.isNotEmpty() -> {
+                EngineTrace.log("create.ocr.paddle_v6_small")
+                PaddleOcrV6(models.ocrPaddleV6Small, paddleV6Alphabet, config.ocr, "small")
+            }
+            config.ocr.engine == "paddle_v6_medium" && models.ocrPaddleV6Medium != null && paddleV6Alphabet.isNotEmpty() -> {
+                EngineTrace.log("create.ocr.paddle_v6_medium")
+                PaddleOcrV6(models.ocrPaddleV6Medium, paddleV6Alphabet, config.ocr, "medium")
+            }
+            else -> Ocr(models.ocr, alphabet, config.ocr)
         }
         // 去字門別（boxfill/aot/lama）共用此入口：AOT 模型必備（lama 缺席/失敗時的退回路徑）；LaMa 選配（缺＝退 aot）。
         EngineTrace.log("create.inpainter")

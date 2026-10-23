@@ -58,9 +58,10 @@ data class OcrConfig(
     // 只在 ncnnFp16Storage 開且 CPU 有 asimdhp 時生效（否則 mixed param 裡的 Cast 會把 fp32 讀成垃圾），Ocr 會自動退回原 param。
     // 真機 9 頁 242 行：mixed 241（唯一不同那行是真值錯）、全 fp16 219 → 預設開；A/B 想固定跑「全 fp16」時關掉。
     val ncnnMixed: Boolean = true,
-    // 〔設定〕OCR 後端選擇："default"＝48px CTC（[Ocr]，日文主路徑）；"paddle"＝[PaddleOcr]（PaddleOCR 阿拉伯文）。
-    // 只影響 [Yakuyomi.create] 建哪顆 OCR；paddle 模型（[ModelSet.ocrPaddleArabic]）或阿拉伯字典缺席時自動退回 default。
-    // 由 app 端決定何時給 "paddle"（來源語言＝阿拉伯文＋使用者在翻譯設定頁選 PaddleOCR）。
+    // 〔設定〕OCR 後端選擇："default"＝48px CTC（[Ocr]，日文主路徑）；"paddle"＝[PaddleOcr]（PaddleOCR 阿拉伯文）；
+    // "paddle_v6_small"／"paddle_v6_medium"＝[PaddleOcrV6]（PP-OCRv6 日／中，fork 下載型模型）。
+    // 只影響 [Yakuyomi.create] 建哪顆 OCR；對應模型或字典缺席時自動退回 default。
+    // 由 app 端決定何時給（來源語言＋使用者在翻譯設定頁的選擇）。
     val engine: String = "default",
     // 〔設定〕實驗（fork）：弱行二次 OCR——首輪讀不到字、或偵測分數低且只讀到 1–2 字的行，把該行裁出 2× 放大再讀一次
     // （小字與阿拉伯文點畫在放大裁切下較易辨識；主路徑與 PaddleOCR 走同一 [OcrEngine] 介面）。代價＝弱行逐行多跑一次推論。

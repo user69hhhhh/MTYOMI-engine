@@ -35,6 +35,16 @@ data class ModelSet(
      */
     val ocrPaddleArabic: String? = null,
     /**
+     * 日／中 OCR（PaddleOCR PP-OCRv6 small → NCNN，`ppocrv6_small_rec.ncnn.param`，同名 `.bin` 需在旁）。**選配**：
+     * fork 的下載型模型（app「下載模型」選單抓到 extra_models），缺了 [PaddleOcrV6] 不可用、退回主 OCR。
+     * 此欄不由 [resolve] 填（理由同 [lamaInpaintOnnx]，且檔名含 `ocr` 會撞 [resolve] 的 OCR 關鍵字比對），
+     * 由 app 端解析 extra_models 後直接給。字典（`ppocrv6_dict.txt`，18,708 字）由 app 讀成行經
+     * [Yakuyomi.create] 的 paddleV6Alphabet 傳入，small／medium 共用。
+     */
+    val ocrPaddleV6Small: String? = null,
+    /** 同 [ocrPaddleV6Small]，medium 版（`ppocrv6_medium_rec.ncnn.param`，fp32、76.5MB）。 */
+    val ocrPaddleV6Medium: String? = null,
+    /**
      * MI-GAN 去字（`migan_inpaint.ncnn.param`，同名 `.bin` 需在旁）。**選配**：balanced 品質去字門別，
      * 缺了 [Inpainter] 自動退回 AOT-GAN [OG]。檔名關鍵字 `migan` 與其他角色不撞
      * （不含 `ocr`/`dbnet`/`aot`/`manga_seg`/`cartoonseg`/`paddle`/`lama`）。
