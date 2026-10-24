@@ -110,7 +110,20 @@ class Pipeline(
         val regions = Grouping.group(lines)
         val ocrMs = System.currentTimeMillis() - tOcr
         // 去字集＝有 OCR 原文的區（空白＝疑似誤偵測，不去字、保畫面）。此集翻譯前就確定 ⇒ 去字可與翻譯並發。
-        val textRegions = regions.filter { it.sourceText.isNotBlank() }
+        val detectedRegions = regions.filter { it.sourceText.isNotBlank() }
+        // [MTYOMI] SCOWL 噪聲過濾：來源英文＋開關開＋詞表非空 → 無任何字典詞的區整區丟棄
+        // （畫面紋理幻讀出的假字；真畫面文字如技能名／吶喊都是真詞、不受影響）。去字與 LLM 前就丟，省 token。
+        val textRegions = if (cfg.ocr.noiseFilter && cfg.ocr.noiseWords.isNotEmpty() &&
+            cfg.translator.fromLangName.startsWith("English", ignoreCase = true)
+        ) {
+            val keptAfterNoise = detectedRegions.filter { !NoiseFilter.isNoise(it.sourceText, cfg.ocr.noiseWords) }
+            if (keptAfterNoise.size != detectedRegions.size) {
+                EngineTrace.log("pipe.noise-filter dropped=${detectedRegions.size - keptAfterNoise.size}/${detectedRegions.size}")
+            }
+            keptAfterNoise
+        } else {
+            detectedRegions
+        }
         // 實驗 matchTextColor：去字前從原圖取樣每區的筆畫色（去字後原字像素就沒了，必須在此量）。
         if (cfg.render.matchTextColor) {
             for (r in textRegions) r.srcTextColor = sampleTextColor(page, detection.textMask, r)
@@ -201,6 +214,13 @@ class Pipeline(
             renderRegions = textRegions
         }
 
+        // [MTYOMI] 目標為阿拉伯文時，排版前把所有區的譯文 tashkeel（母音符號）剝掉——
+        // 使用者指示：不要標音（flash-lite 等模型常過度標音）。fitRetranslate 重排前會再剝一次。
+        val arabicTarget = cfg.translator.toLangName.startsWith("Arabic", ignoreCase = true)
+        if (arabicTarget) {
+            renderRegions.forEach { it.translatedText = stripTashkeel(it.translatedText) }
+        }
+
         // 等去字完成（多半已與翻譯重疊跑完）
         EngineTrace.log("pipe.inpaint.await")
         val cleaned = try {
@@ -237,6 +257,9 @@ class Pipeline(
                         }
                     }
                     if (changed) {
+                        if (arabicTarget) {
+                            targets.forEach { it.translatedText = stripTashkeel(it.translatedText) }
+                        }
                         val tR2 = System.currentTimeMillis()
                         finalPage = Renderer.render(cleaned, renderRegions, cfg.render, typeface)
                         renderMs += System.currentTimeMillis() - tR2
@@ -255,6 +278,11 @@ class Pipeline(
             PageAnalysis(detection.textMask, textRegions),
         )
     }
+
+    private val tashkeelRegex = Regex("[\\u064B-\\u0652\\u0653-\\u0655\\u0670\\u06D6-\\u06ED]")
+
+    /** [MTYOMI] 剝除阿拉伯文 tashkeel（母音符號 FATHATAN..SUKUN、Quranic 標記等），只留字母本體。 */
+    private fun stripTashkeel(text: String): String = tashkeelRegex.replace(text, "")
 
     /**
      * 單緒暖機：對 detector / OCR / 去字三個原生 session 各空跑一次推論，完成首次 lazy 初始化。

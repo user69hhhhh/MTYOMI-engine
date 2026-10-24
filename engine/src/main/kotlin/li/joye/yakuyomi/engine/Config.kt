@@ -66,6 +66,11 @@ data class OcrConfig(
     // 〔設定〕實驗（fork）：弱行二次 OCR——首輪讀不到字、或偵測分數低且只讀到 1–2 字的行，把該行裁出 2× 放大再讀一次
     // （小字與阿拉伯文點畫在放大裁切下較易辨識；主路徑與 PaddleOCR 走同一 [OcrEngine] 介面）。代價＝弱行逐行多跑一次推論。
     val secondPass: Boolean = false,
+    // 〔設定〕實驗（MTYOMI）：英文 OCR 噪聲過濾（SCOWL 詞表，仿 xpmanga）——來源為英文且開關開時，
+    // OCR 區內找不到任何字典詞的，在去字／翻譯前整區丟棄（多為從畫面紋理幻讀出的假字）。
+    // [noiseWords] 由 app 端從內建 asset 載入後填入；空集合＝過濾不生效。
+    val noiseFilter: Boolean = false,
+    val noiseWords: Set<String> = emptySet(),
 )
 
 // 預設 few-shot（日→繁中）：示範 <|i|> 逐行格式。改語言對時連同 toLangName/fromLangName 一起換成對應譯文。

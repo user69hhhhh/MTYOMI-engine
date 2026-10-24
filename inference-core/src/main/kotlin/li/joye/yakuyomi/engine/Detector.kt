@@ -1,6 +1,7 @@
 package li.joye.yakuyomi.engine
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.util.Log
 import kotlin.math.exp
 import kotlin.math.min
@@ -38,7 +39,22 @@ class Detector(
      * out0=db（2ch，ch0=raw logits→Kotlin 補 sigmoid）、out1=mask（1ch，半/全解析度平台不定、已 sigmoid）。
      * 後處理＝[linesFromProbMap]（連通元件+minAreaRect+unclip；score=component-mean prob＝DB box_score_fast）。
      */
+    /**
+     * [MTYOMI] Strip-aware entry point: long strips go through tiled
+     * detection ([detectStrip]); everything else takes the original single
+     * pass ([detectSingle]) unchanged, so normal manga pages behave exactly
+     * as before.
+     */
     fun detect(page: Bitmap): Detection {
+        return if (StripTiling.isStrip(page.width, page.height, cfg.dbnetInputSize)) {
+            detectStrip(page)
+        } else {
+            detectSingle(page)
+        }
+    }
+
+    /** The original single-pass DBNet detection, untouched. */
+    private fun detectSingle(page: Bitmap): Detection {
         val pre = ImageOps.detectorChwDbnet(page, cfg.dbnetInputSize, cfg.detectUnsharp)
         val inW = pre.w
         val inH = pre.h
@@ -67,6 +83,72 @@ class Detector(
         val textMask = segToMask(cfg, mask, mw, mh, pre.ratio * mw.toFloat() / inW, page.width, page.height)
         Log.i(TAG, "DBNet 偵測到 ${lines.size} 行（in ${inW}x$inH mask ${mw}x$mh）")
         return Detection(lines, textMask)
+    }
+
+    /**
+     * [MTYOMI] Strip detection: slice the strip at quiet bands, run the
+     * normal single-pass detection per tile, map boxes back to strip
+     * coordinates, dedupe across tiles, and stitch the per-tile stroke masks
+     * into one full-strip mask. Callers (Pipeline, night render) see exactly
+     * the same [Detection] shape as a single pass — the tiling is invisible
+     * downstream, and erase/render still operate on the whole strip.
+     */
+    private fun detectStrip(page: Bitmap): Detection {
+        val (rowEnergy, rowScale) = rowEnergies(page)
+        val bands = StripTiling.findSafeBands(rowEnergy, rowScale)
+        val tiles = StripTiling.computeTiles(
+            page.height,
+            StripTiling.maxTileHeight(cfg.dbnetInputSize),
+            bands,
+        )
+        val fullMask = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
+        fullMask.eraseColor(MASK_OFF)
+        val canvas = Canvas(fullMask)
+        val tileLines = ArrayList<StripTiling.TileLines>()
+        for (tile in tiles) {
+            val tileBmp = Bitmap.createBitmap(page, 0, tile.y0, page.width, tile.y1 - tile.y0)
+            try {
+                val det = detectSingle(tileBmp)
+                tileLines.add(StripTiling.TileLines(tile.y0, det.lines))
+                canvas.drawBitmap(det.textMask, 0f, tile.y0.toFloat(), null)
+                det.textMask.recycle()
+            } finally {
+                tileBmp.recycle()
+            }
+        }
+        val lines = StripTiling.mergeTiles(tileLines)
+        Log.i(TAG, "strip 偵測：${tiles.size} tiles、${bands.size} 安全帶、${lines.size} 行（${page.width}x${page.height}）")
+        return Detection(lines, fullMask)
+    }
+
+    /**
+     * [MTYOMI] Per-row gradient energy for safe-band finding: downscale to
+     * 200px wide (height capped at 8192 rows to bound memory), then each
+     * row's mean absolute horizontal luminance step, normalized to 0..1.
+     * Text rows are edge-dense; gutters and flat art are quiet.
+     * Returns (energies, full-res px per downscaled row).
+     */
+    private fun rowEnergies(page: Bitmap): Pair<FloatArray, Float> {
+        val downW = 200
+        val downH = minOf((page.height * downW) / page.width, 8192).coerceAtLeast(1)
+        val small = Bitmap.createScaledBitmap(page, downW, downH, true)
+        val px = IntArray(downW * downH)
+        small.getPixels(px, 0, downW, 0, 0, downW, downH)
+        if (small !== page) small.recycle()
+        val energy = FloatArray(downH)
+        for (y in 0 until downH) {
+            var sum = 0f
+            val row = y * downW
+            var prev = ((px[row] shr 16) and 0xFF) + ((px[row] shr 8) and 0xFF) + (px[row] and 0xFF)
+            for (x in 1 until downW) {
+                val p = px[row + x]
+                val lum = ((p shr 16) and 0xFF) + ((p shr 8) and 0xFF) + (p and 0xFF)
+                sum += kotlin.math.abs(lum - prev).toFloat()
+                prev = lum
+            }
+            energy[y] = sum / ((downW - 1) * 765f)
+        }
+        return energy to (page.height.toFloat() / downH)
     }
 
     /**
